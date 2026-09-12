@@ -96,25 +96,18 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/HK-BEUP/V2bX-script/master/install.sh)
-    if [[ $? == 0 ]]; then
-        if [[ $# == 0 ]]; then
-            start
-        else
-            start 0
-        fi
-    fi
+    bash /usr/local/V2bX/install.sh
 }
 
 update() {
     if [[ $# == 0 ]]; then
         echo && echo -n -e "输入指定版本(默认最新版): " && read version
     else
-        version=$2
+        version=${2:-latest}
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/HK-BEUP/V2bX-script/master/install.sh) $version
+    bash /usr/local/V2bX/install.sh "${version:-latest}"
     if [[ $? == 0 ]]; then
-        echo -e "${green}更新完成，已自动重启 V2bX，请使用 V2bX log 查看运行日志${plain}"
+        echo -e "${green}更新流程完成，运行/停止状态按升级器输出为准，请继续核对客户端连接${plain}"
         exit
     fi
 
@@ -300,15 +293,9 @@ install_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/V2bX -N --no-check-certificate https://raw.githubusercontent.com/HK-BEUP/V2bX-script/master/V2bX.sh
-    if [[ $? != 0 ]]; then
-        echo ""
-        echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
-        before_show_menu
-    else
-        chmod +x /usr/bin/V2bX
-        echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
-    fi
+    echo '管理脚本随校验过的完整安装包更新；不会单独拉取上游脚本。'
+    confirm '这会执行完整升级，正在运行的服务将短暂重启，是否继续？' 'n' || return
+    update 0 latest
 }
 
 # 0: running, 1: not running, 2: not installed
@@ -615,6 +602,8 @@ EOF
 }
 
 generate_config_file() {
+    python3 /usr/local/V2bX/initconfig.py
+    return $?
     echo -e "${yellow}V2bX 配置文件生成向导${plain}"
     echo -e "${red}请阅读以下注意事项：${plain}"
     echo -e "${red}1. 目前该功能正处测试阶段${plain}"
@@ -1025,7 +1014,7 @@ if [[ $# > 0 ]]; then
         "log") check_install 0 && show_log 0 ;;
         "update") check_install 0 && update 0 $2 ;;
         "config") config $* ;;
-        "generate") generate_config_file ;;
+        "generate"|"init") generate_config_file ;;
         "install") check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
         "x25519") check_install 0 && generate_x25519_key 0 ;;
