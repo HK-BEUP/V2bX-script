@@ -1,5 +1,8 @@
 import importlib.util
+import os
 from pathlib import Path
+import stat
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +49,19 @@ class GuardTests(unittest.TestCase):
                 patch.object(g.zipfile, 'ZipFile') as archive, self.assertRaises(RuntimeError):
             g.inspect_patch(Path('/synthetic.zip'))
         archive.assert_not_called()
+
+    def test_only_sanitized_result_readable_under_private_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            secret = temp / 'synthetic-private.json'
+            old = os.umask(0o077)
+            try:
+                g.save(secret, {'synthetic': True})
+                g.export_result(temp, {'ok': True, 'checks': []})
+            finally:
+                os.umask(old)
+            self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((temp / 'beup-observation-results/systemd.json').stat().st_mode), 0o644)
 
 
 if __name__ == '__main__':

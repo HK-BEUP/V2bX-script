@@ -67,6 +67,13 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
+def export_result(temp, value):
+    # The ordinary runner uploads this fixed sanitized file, never ROOT data.
+    path = temp / 'beup-observation-results/systemd.json'
+    save(path, value)
+    path.chmod(0o644)
+
+
 def inspect_patch(path):
     if sha(path) != PATCH_SHA:
         raise RuntimeError('rebuilt archive differs from original patch')
@@ -188,7 +195,7 @@ def run(source, temp):
         result['finished_at'] = time.time()
         result['ok'] = result['ok'] and result['test_services_stopped']
         # Do not export root fixture files, backups, tickets, leases or journals.
-        save(temp / 'beup-observation-results/systemd.json', result)
+        export_result(temp, result)
     print(json.dumps({'ok': result['ok'], 'phase': 'lifecycle'}), flush=True)
     return 0 if result['ok'] else 1
 
