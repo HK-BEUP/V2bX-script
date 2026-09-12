@@ -1,0 +1,43 @@
+name: Observation patch native amd64 gate
+on:
+  push:
+    branches: [beup/observation-amd64-20260913]
+    paths:
+      - .github/workflows/observation-amd64.yml
+      - qa/observation/**
+permissions:
+  contents: read
+jobs:
+  native-amd64:
+    if: github.repository == 'HK-BEUP/V2bX-script' && github.ref == 'refs/heads/beup/observation-amd64-20260913'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: false
+      - name: Verify isolated-runner refusal guards
+        run: python3 -m unittest discover -s qa/observation -p test_gha_amd64.py -v
+      - name: Reproduce the original patch and verify public core
+        run: python3 qa/observation/gha_amd64.py build
+      - name: Install synthetic fixture dependency only
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+      - name: Real systemd install, natural renewal, removal and rollback
+        run: |
+          sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" GITHUB_REF="$GITHUB_REF" \
+            GITHUB_SHA="$GITHUB_SHA" RUNNER_TEMP="$RUNNER_TEMP" PYTHONDONTWRITEBYTECODE=1 \
+            python3 qa/observation/gha_amd64.py run
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: observation-amd64-results
+          path: ${{ runner.temp }}/beup-observation-results/*.json
+          if-no-files-found: error
+          retention-days: 14
