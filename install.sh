@@ -37,5 +37,20 @@ with tempfile.TemporaryDirectory(prefix='beup-v2bx-') as td:
         if i.file_size>262144 or stat.S_ISLNK(i.external_attr>>16): raise SystemExit('非法升级器成员')
         helper=os.path.join(td,'upgrade.py')
         with open(helper,'wb') as f: f.write(z.read(i))
+    # Require the capability marker before running any version's installer.
+    with zipfile.ZipFile(archive) as z:
+        meta=json.loads(z.read('RELEASE.json'))
+        if meta.get('legacy_accounting_v1') is not True:
+            raise SystemExit('该包不含旧队列保护；取消安装，保留现有程序和 journal')
     subprocess.run([sys.executable,helper,archive,matches[0],version],check=True)
+    sys.path.insert(0, '/usr/local/V2bX')
+    from upgrade import load_config
+    from pathlib import Path
+    if not load_config(Path('/etc/V2bX/config.json'))['Nodes']:
+        try: tty=open('/dev/tty','r')
+        except OSError:
+            print('无交互终端；请运行 python3 /usr/local/V2bX/initconfig.py --start 完成配置')
+        else:
+            with tty:
+                subprocess.run([sys.executable,'/usr/local/V2bX/initconfig.py','--start'],stdin=tty,check=True)
 PY

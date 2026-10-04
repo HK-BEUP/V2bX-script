@@ -116,9 +116,9 @@ class UpgradeTests(unittest.TestCase):
         def interrupt():raise KeyboardInterrupt()
         self.service.on_stop=interrupt
         with self.assertRaises(KeyboardInterrupt):self.run_upgrade()
-        self.unchanged();self.assertTrue(self.service.active())
+        self.unchanged();self.assertFalse(self.service.active())
     def test_comments_and_escaped_input(self):
-        c=initconfig.make_config('https://example.com/base','synthetic-"-\\-token','5')
+        c=initconfig.make_config('https://example.com','synthetic-"-\\-token','5')
         (self.config/'config.json').write_text('// comment\n'+json.dumps(c)+'/* tail */')
         self.assertEqual(u.load_config(self.config/'config.json'),c)
     def test_config_symlink_refused(self):
@@ -160,7 +160,9 @@ class BootstrapTests(unittest.TestCase):
     def run_bootstrap(self,mode):
         import io
         payload=io.BytesIO()
-        with zipfile.ZipFile(payload,'w') as z:z.writestr('upgrade.py',b'# synthetic helper')
+        with zipfile.ZipFile(payload,'w') as z:
+            z.writestr('upgrade.py',b'# synthetic helper')
+            z.writestr('RELEASE.json',json.dumps({'legacy_accounting_v1':mode!='old'}))
         data=payload.getvalue();name='V2bX-linux-64.zip';checksum=hashlib.sha256(data).hexdigest()
         sums=checksum+'  '+name+'\n'
         if mode=='duplicate':sums+=sums
@@ -176,7 +178,7 @@ class BootstrapTests(unittest.TestCase):
         code=Path(__file__).with_name('install.sh').read_text().split("<<'PY'\n",1)[1].rsplit('\nPY',1)[0]
         original_umask=os.umask(0o077);os.umask(original_umask)
         try:
-            with patch('sys.argv',['-',VERSION]),patch('platform.system',return_value='Linux'),patch('platform.machine',return_value='x86_64'),patch('os.path.isdir',return_value=True),patch('urllib.request.urlopen',side_effect=fetch),patch('subprocess.run') as run:
+            with patch('sys.argv',['-',VERSION]),patch('platform.system',return_value='Linux'),patch('platform.machine',return_value='x86_64'),patch('os.path.isdir',return_value=True),patch('urllib.request.urlopen',side_effect=fetch),patch('subprocess.run') as run, patch('upgrade.load_config',return_value={'Nodes':[{}]}):
                 if mode=='ok':exec(compile(code,'bootstrap','exec'),{});self.assertEqual(run.call_count,1)
                 else:
                     with self.assertRaises((SystemExit,OSError)):exec(compile(code,'bootstrap','exec'),{})
@@ -187,5 +189,41 @@ class BootstrapTests(unittest.TestCase):
     def test_duplicate_sum(self):self.run_bootstrap('duplicate')
     def test_missing_sum(self):self.run_bootstrap('missing')
     def test_network_failure(self):self.run_bootstrap('network')
+    def test_old_package_refused(self):self.run_bootstrap('old')
+
+class LegacyInstallTests(unittest.TestCase):
+    def test_fresh_scopes_and_logs(self):
+        c=initconfig.make_config('https://panel.example/','synthetic','42,43')
+        other=initconfig.make_config('https://other.example','synthetic','42')
+        paths=[n['LegacyAccounting']['Directory'] for n in c['Nodes']]+[other['Nodes'][0]['LegacyAccounting']['Directory']]
+        self.assertEqual(len(set(paths)),3)
+        self.assertTrue(all(n.get('TransferAccounting') is None for n in c['Nodes']))
+        self.assertEqual(c['Log']['Output'],'/dev/null')
+        self.assertEqual(c['Cores'][0]['Log']['Level'],'none')
+        self.assertIn('StandardOutput=null',u.UNIT)
+        self.assertIn('StandardError=null',u.UNIT)
+        self.assertIn('TimeoutStopSec=infinity',u.UNIT)
+    def test_panel_path_and_malformed_port_refused(self):
+        for host in ['https://example.com/base','https://exam ple.com','https://example.com:bad']:
+            with self.subTest(host=host),self.assertRaises(ValueError):initconfig.make_config(host,'synthetic','42')
+    def test_systemd_stop_failure_does_not_claim_clean_exit(self):
+        from types import SimpleNamespace
+        service=u.Systemd();service.stop_budget=330
+        with patch.object(service,'call',side_effect=[SimpleNamespace(stdout=''),SimpleNamespace(stdout='timeout')]) as call:
+            with self.assertRaises(RuntimeError):service.stop()
+            self.assertEqual(call.call_args_list[0].kwargs['timeout'],360)
+    def test_insufficient_systemd_budget_refused_before_stop(self):
+        from types import SimpleNamespace
+        service=u.Systemd();service.minimum_stop_seconds=180
+        with patch.object(service,'call',side_effect=[SimpleNamespace(stdout=''),SimpleNamespace(stdout='1min 30s')]):
+            with self.assertRaises(ValueError):service.validate()
+        for value in ['3min','infinity']:
+            with self.subTest(value=value),patch.object(service,'call',side_effect=[SimpleNamespace(stdout=''),SimpleNamespace(stdout=value)]),patch.object(service,'active',return_value=False):
+                service.validate()
+    def test_fresh_health_needs_listener(self):
+        from types import SimpleNamespace
+        service=u.Systemd();service.required_ports=set()
+        with patch.object(service,'call',return_value=SimpleNamespace(stdout='ActiveState=active\nMainPID=42\nNRestarts=0\nExecMainStartTimestampMonotonic=123\n')),patch.object(service,'listening',return_value=set()),patch('upgrade.time.sleep'):
+            self.assertFalse(service.healthy())
 
 if __name__=='__main__':unittest.main()

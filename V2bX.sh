@@ -66,7 +66,7 @@ check_ipv6_support() {
 }
 
 confirm() {
-    if [[ $# > 1 ]]; then
+    if [[ $# -gt 1 ]]; then
         echo && read -rp "$1 [默认$2]: " temp
         if [[ x"${temp}" == x"" ]]; then
             temp=$2
@@ -101,7 +101,7 @@ install() {
 
 update() {
     if [[ $# == 0 ]]; then
-        echo && echo -n -e "输入指定版本(默认最新版): " && read version
+        echo && echo -n -e "输入指定版本(默认最新版，保留已有配置和流量 journal): " && read version
     else
         version=${2:-latest}
     fi
@@ -184,7 +184,7 @@ start() {
         sleep 2
         check_status
         if [[ $? == 0 ]]; then
-            echo -e "${green}V2bX 启动成功，请使用 V2bX log 查看运行日志${plain}"
+            echo -e "${green}V2bX 已运行；新装默认关闭日志，请在面板核对节点及流量入账${plain}"
         else
             echo -e "${red}V2bX可能启动失败，请稍后使用 V2bX log 查看日志信息${plain}"
         fi
@@ -218,12 +218,13 @@ restart() {
     if [[ x"${release}" == x"alpine" ]]; then
         service V2bX restart
     else
+        echo "正在等待尾流结清后重启，请勿强制终止。"
         systemctl restart V2bX
     fi
     sleep 2
     check_status
     if [[ $? == 0 ]]; then
-        echo -e "${green}V2bX 重启成功，请使用 V2bX log 查看运行日志${plain}"
+        echo -e "${green}V2bX 已重启；请在面板核对节点及流量入账${plain}"
     else
         echo -e "${red}V2bX可能启动失败，请稍后使用 V2bX log 查看日志信息${plain}"
     fi
@@ -426,7 +427,7 @@ add_node_config() {
         core_hysteria2=true
     else
         echo "无效的选择。请选择 1 2 3。"
-        continue
+        return 1
     fi
     while true; do
         read -rp "请输入节点Node ID：" NodeID
@@ -1003,7 +1004,7 @@ show_menu() {
 }
 
 
-if [[ $# > 0 ]]; then
+if [[ $# -gt 0 ]]; then
     case $1 in
         "start") check_install 0 && start 0 ;;
         "stop") check_install 0 && stop 0 ;;

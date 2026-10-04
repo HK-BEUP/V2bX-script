@@ -21,7 +21,7 @@ import time
 import zipfile
 
 MANAGED = ('V2bX','V2bX.sh','install.sh','upgrade.py','initconfig.py','RELEASE.json')
-ALLOWED = set(MANAGED) | {'README.md','LICENSE','BEUP_OBSERVATION.md','config.json',
+ALLOWED = set(MANAGED) | {'README.md','LICENSE','XRAY_LICENSE','BEUP_OBSERVATION.md','BEUP_LEGACY.md','config.json',
                          'custom_inbound.json','custom_outbound.json','dns.json','route.json','geoip.dat','geosite.dat'}
 
 def digest(path):
@@ -113,34 +113,45 @@ class Systemd:
                 fields=line.split()
                 if fields[3]=='0A' and fields[9] in inodes:ports.add(family+':'+fields[1])
         return ports
-    def call(self,*args,check=True):
-        return subprocess.run(['systemctl',*args],check=check,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=90)
+    def call(self,*args,check=True,timeout=90):
+        return subprocess.run(['systemctl',*args],check=check,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
     def active(self): return self.call('is-active','--quiet','V2bX',check=False).returncode==0
     def validate(self):
         cmd=self.call('show','V2bX','-p','ExecStart','--value').stdout.strip()
         # Nonstandard commands/config paths require a separate upgrade plan.
         if cmd and not re.search(r'argv\[\]=/usr/local/V2bX/V2bX server\s*;',cmd):
             raise ValueError('自定义 ExecStart 需人工核对；未停止服务')
+        if getattr(self,'minimum_stop_seconds',0):
+            value=self.call('show','V2bX','-p','TimeoutStopUSec','--value').stdout.strip()
+            if value != 'infinity':
+                parts=re.findall(r'(\d+(?:\.\d+)?)(us|ms|s|min|h|d)',value)
+                factors={'us':0.000001,'ms':0.001,'s':1,'min':60,'h':3600,'d':86400}
+                seconds=sum(float(n)*factors[unit] for n,unit in parts)
+                if not parts or re.sub(r'(\d+(?:\.\d+)?)(us|ms|s|min|h|d)|\s+', '', value) or seconds < self.minimum_stop_seconds:
+                    raise ValueError('已有服务退出超时不足以结清全部节点；未停止服务，请先核对 TimeoutStopSec')
         self.required_ports=set()
         if self.active():
             pid=int(self.call('show','V2bX','-p','MainPID','--value').stdout.strip())
             self.required_ports=self.listening(pid)
             if not self.required_ports:raise ValueError('运行服务没有可核对的 TCP 监听；请先确认节点状态')
     def stop(self):
-        self.call('stop','V2bX')
+        self.call('stop','V2bX',timeout=getattr(self,'stop_budget',180)+30)
+        result=self.call('show','V2bX','-p','Result','--value').stdout.strip()
+        if result in ('timeout','signal','core-dump','watchdog'): raise RuntimeError('服务退出未确认；保留当前程序和流量 journal，请人工检查')
         if self.active(): raise RuntimeError('服务未停止')
     def start(self): self.call('start','V2bX')
     def reload(self): self.call('daemon-reload')
     def healthy(self):
         stable=None;stable_seconds=0
-        for _ in range(60):
+        for _ in range(180):
             time.sleep(1)
             state=self.call('show','V2bX','-p','ActiveState','-p','MainPID','-p','NRestarts','-p','ExecMainStartTimestampMonotonic').stdout
             if 'ActiveState=active' not in state or 'MainPID=0\n' in state: return False
             if stable is None:stable=state
             elif stable!=state:return False
             fields=dict(line.split('=',1) for line in state.splitlines() if '=' in line)
-            if self.required_ports.issubset(self.listening(int(fields.get('MainPID','0')))):
+            ports=self.listening(int(fields.get('MainPID','0')))
+            if ports and self.required_ports.issubset(ports):
                 stable_seconds+=1
                 if stable_seconds>=15:return True
             else:stable_seconds=0
@@ -158,6 +169,10 @@ WorkingDirectory=/usr/local/V2bX/
 ExecStart=/usr/local/V2bX/V2bX server
 Restart=always
 RestartSec=10
+# Each accounting scope has a bounded graceful close; never SIGKILL its journal.
+TimeoutStopSec=infinity
+StandardOutput=null
+StandardError=null
 LimitNOFILE=999999
 [Install]
 WantedBy=multi-user.target
@@ -169,14 +184,19 @@ def transaction(archive,expected,version,root,service,machine,probe=None):
     for p in (program,config,unit): plain_path(p)
     for p in (root/'usr/bin/V2bX',root/'usr/bin/v2bx'):
         if p.is_symlink() and os.readlink(p) not in ('/usr/bin/V2bX','/usr/local/V2bX/V2bX.sh'): raise ValueError('未知管理命令链接')
-    before=tree_hash(config); existed=program.exists();was_active=service.active();service.validate()
+    before=tree_hash(config); existed=program.exists();was_active=service.active()
     watched=[program/n for n in MANAGED]+[unit]
     def fingerprints():
         for p in watched: plain_path(p)
         return {str(p.relative_to(root)):digest(p) if p.exists() else None for p in watched}
     original=fingerprints()
     if existed and not (config/'config.json').is_file(): raise ValueError('已有安装缺少配置；需要人工核对')
-    if (config/'config.json').exists(): load_config(config/'config.json')
+    if (config/'config.json').exists():
+        current_config=load_config(config/'config.json')
+        accounting=sum(bool(n.get('Options',n).get('LegacyAccounting') or n.get('Options',n).get('TransferAccounting')) for n in current_config['Nodes'])
+        service.stop_budget=max(180,150*accounting+30)
+        service.minimum_stop_seconds=service.stop_budget if accounting else 0
+    service.validate()
     program.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.beup-stage-',dir=program.parent) as td:
         stage=Path(td);payload=stage/'payload';payload.mkdir()
@@ -209,7 +229,7 @@ def transaction(archive,expected,version,root,service,machine,probe=None):
         switched=False;moved=False;created_unit=False;created_config=False;stopped=False;commands_changed=False
         try:
             if was_active:
-                stopped=True;service.stop()
+                service.stop();stopped=True
             if tree_hash(config)!=before: raise RuntimeError('配置变化；已取消切换')
             if existed: program.rename(backup/'program');moved=True
             new.rename(program);switched=True
@@ -260,7 +280,7 @@ def main():
         result=transaction(Path(sys.argv[1]),sys.argv[2],sys.argv[3],Path('/'),Systemd(),platform.machine())
     print('安装完成；备份：'+result['backup'])
     if result['previously_active']: print('已恢复原 TCP 监听并通过 15 秒进程稳定检查；仍需客户端业务验收')
-    else: print('保留停止状态。新节点请执行 v2bx init，再确认 v2bx start；不会自动启动空配置')
+    else: print('程序已安装，配置与启动由新装向导继续；已有节点保留原停止状态')
 
 if __name__=='__main__':
     try: main()
