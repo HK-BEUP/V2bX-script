@@ -38,6 +38,53 @@ def node_origin(node):
     api = node_api(node)
     return make_config(api['ApiHost'], api['ApiKey'], str(api['NodeID']))['Nodes'][0]['ApiHost']
 
+def prepare_new_accounting(root, nodes):
+    """Provision only new default identities, before saving or stopping services.
+
+    The runtime requires an existing private directory. Never chmod/chown an
+    existing path, follow symlinks, or open/remove any accounting journal.
+    The CLI supplies /; tests supply a private filesystem root.
+    """
+    directories = []
+    for node in nodes:
+        api = node_api(node)
+        ledger = node.get('Options', node).get('LegacyAccounting')
+        if not ledger:
+            continue
+        expected = make_config(api['ApiHost'], api['ApiKey'], str(api['NodeID']))['Nodes'][0]['LegacyAccounting']['Directory']
+        if ledger.get('Directory') != expected:
+            raise RuntimeError('新增节点的可靠上报目录不是默认独立路径；未修改配置或服务')
+        directories.append(expected)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    created = []
+    for directory in directories:
+        fd = None
+        location = '/'
+        try:
+            fd = os.open(root, flags)
+            for part in directory.lstrip('/').split('/'):
+                parent = os.fstat(fd)
+                if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o022:
+                    raise RuntimeError('可靠上报目录父级所有者或写入权限不安全：' + location)
+                location = location.rstrip('/') + '/' + part
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=fd)
+                    created.append(location)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            info = os.fstat(fd)
+            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise RuntimeError('可靠上报目录须由 root 持有且权限为 0700：' + directory)
+        except OSError:
+            raise RuntimeError('可靠上报目录不可用（须为真实目录且可安全访问）：' + location) from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return created
+
 def replacement_config(current, host, key, ids):
     """Retain globals and matching nodes; only new identities use new-install defaults."""
     fresh = make_config(host, key, ids)
@@ -134,6 +181,8 @@ def reconfigure(root, service, read=None, secret=None):
     check(baseline)
     if service.active() != was_active:
         raise RuntimeError('服务状态已变化；取消重新配置')
+    new_nodes = [n for n in candidate['Nodes'] if (node_origin(n), node_api(n)['NodeID']) not in old_identities]
+    created_directories = prepare_new_accounting(root, new_nodes)
     backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     backup = Path(tempfile.mkdtemp(prefix='reconfigure-', dir=backup_root)); backup.chmod(0o700)
     saved = backup/'etc/V2bX/config.json'
@@ -144,6 +193,7 @@ def reconfigure(root, service, read=None, secret=None):
     staged = backup/'candidate.json'; staged.write_bytes(data); staged.chmod(0o600)
     load_config(staged)  # Parse the exact candidate before any interruption.
     record = {'status': 'prepared', 'was_active': was_active, 'original_mode': original_mode,
+              'created_accounting_directories': created_directories,
               'original_sha256': hashlib.sha256(original).hexdigest() if original is not None else None,
               'candidate_sha256': hashlib.sha256(data).hexdigest()}
     def receipt(status):
@@ -195,6 +245,40 @@ def reconfigure(root, service, read=None, secret=None):
           '配置已保存；保持停止状态，可使用 v2bx start 启动。')
     return {'status': 'applied', 'backup': str(backup), 'restarted': was_active}
 
+def initialize(root, service, start=False, read=None, secret=None):
+    """Fresh-install wizard; the CLI locks and supplies the real root/manager."""
+    read = read or input
+    secret = secret or getpass.getpass
+    path = root/'etc/V2bX/config.json'
+    plain_path(path)
+    if service.active():
+        raise SystemExit('服务运行中；初始化不会修改正在使用的配置')
+    baseline=digest(path) if path.exists() else None
+    if path.exists() and load_config(path)['Nodes']: raise SystemExit('已有节点配置，拒绝重写；升级无需重新配置')
+    print('新装：VLESS + TCP + REALITY + Vision，旧 Redis/Horizon 可靠上报，节点日志关闭。')
+    c=make_config(read('HTTPS 面板地址：').strip(),secret('API Key（不回显）：'),read('NodeID（多个用逗号分隔）：'))
+    action = '保存配置并启动、设置开机自启' if start else '保存配置（暂不启动）'
+    if read(action+'？输入 YES：')!='YES': return
+    if (digest(path) if path.exists() else None)!=baseline: raise SystemExit('配置已变化，取消保存')
+    prepare_new_accounting(root, c['Nodes'])
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if path.exists():
+        backup=Path(tempfile.mkdtemp(prefix='init-',dir=path.parent));backup.chmod(0o700)
+        (backup/'config.json').write_bytes(path.read_bytes())
+        (backup/'SHA256SUMS').write_text(baseline+'  config.json\n')
+    fd,tmp=tempfile.mkstemp(prefix='.config-',dir=path.parent)
+    with os.fdopen(fd,'w') as f: json.dump(c,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+    os.replace(tmp,path)
+    if start:
+        service.required_ports = set()
+        service.start()
+        if not service.healthy():
+            raise RuntimeError('配置已保留，启动尚未通过监听检查；请核对面板地址、节点参数和连接状态后执行 v2bx status')
+        service.enable()
+        print('安装及启动完成，已设置开机自启；请在面板确认该节点流量入账。')
+    else:
+        print('配置已保存。执行 v2bx start 启动、v2bx enable 开机自启。')
+
 def main(start=False, manual=False):
     if os.geteuid()!=0: raise SystemExit('需要 root')
     os.umask(0o077)
@@ -206,32 +290,7 @@ def main(start=False, manual=False):
         if manual:
             if not sys.stdin.isatty(): raise SystemExit('重新配置需要交互终端；未修改配置或服务')
             return reconfigure(Path('/'), service)
-        if service.active():
-            raise SystemExit('服务运行中；初始化不会修改正在使用的配置')
-        baseline=digest(path) if path.exists() else None
-        if path.exists() and load_config(path)['Nodes']: raise SystemExit('已有节点配置，拒绝重写；升级无需重新配置')
-        print('新装：VLESS + TCP + REALITY + Vision，旧 Redis/Horizon 可靠上报，节点日志关闭。')
-        c=make_config(input('HTTPS 面板地址：').strip(),getpass.getpass('API Key（不回显）：'),input('NodeID（多个用逗号分隔）：'))
-        action = '保存配置并启动、设置开机自启' if start else '保存配置（暂不启动）'
-        if input(action+'？输入 YES：')!='YES': return
-        if (digest(path) if path.exists() else None)!=baseline: raise SystemExit('配置已变化，取消保存')
-        path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-        if path.exists():
-            backup=Path(tempfile.mkdtemp(prefix='init-',dir=path.parent));backup.chmod(0o700)
-            (backup/'config.json').write_bytes(path.read_bytes())
-            (backup/'SHA256SUMS').write_text(baseline+'  config.json\n')
-        fd,tmp=tempfile.mkstemp(prefix='.config-',dir=path.parent)
-        with os.fdopen(fd,'w') as f: json.dump(c,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
-        os.replace(tmp,path)
-        if start:
-            service.required_ports = set()
-            service.start()
-            if not service.healthy():
-                raise RuntimeError('配置已保留，启动尚未通过监听检查；请核对面板地址、节点参数和连接状态后执行 v2bx status')
-            service.enable()
-            print('安装及启动完成，已设置开机自启；请在面板确认该节点流量入账。')
-        else:
-            print('配置已保存。执行 v2bx start 启动、v2bx enable 开机自启。')
+        return initialize(Path('/'), service, start=start)
 
 if __name__=='__main__':
     try:

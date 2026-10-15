@@ -99,6 +99,38 @@ class ReconfigureTests(unittest.TestCase):
         self.assertTrue(self.service.running)
         self.assert_preserved()
 
+    def new_directory(self):
+        node = wizard.make_config('https://panel.example','synthetic','44')['Nodes'][0]
+        return self.root/node['LegacyAccounting']['Directory'].lstrip('/')
+
+    def test_new_directory_exists_before_old_process_is_stopped(self):
+        new = self.new_directory()
+        self.service.on_stop = lambda:self.assertEqual(new.stat().st_mode & 0o777,0o700)
+        result = self.run_wizard()
+        receipt = json.loads((Path(result['backup'])/'transaction.json').read_text())
+        self.assertIn('/'+str(new.relative_to(self.root)),receipt['created_accounting_directories'])
+        self.assert_preserved()
+
+    def test_unsafe_new_directory_keeps_current_process_and_config(self):
+        new = self.new_directory(); new.mkdir(parents=True); new.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError,'0700'):self.run_wizard()
+        self.assertNotIn('stop',self.service.calls)
+        self.assertTrue(self.service.running)
+        self.assertEqual(upgrade.tree_hash(self.path.parent),self.before)
+        self.assertEqual(new.stat().st_mode & 0o777,0o755)
+
+    def test_failed_reconfigure_preserves_new_accounting_journal(self):
+        new = self.new_directory()
+        def start_once():
+            (new/'journal.json').write_bytes(b'synthetic-pending-batch')
+            self.service.on_start = None
+        self.service.on_start = start_once
+        self.service.accept = [False,True]
+        with self.assertRaisesRegex(RuntimeError,'原运行状态已恢复'):self.run_wizard()
+        self.assertEqual((new/'journal.json').read_bytes(),b'synthetic-pending-batch')
+        self.assertEqual(upgrade.tree_hash(self.path.parent),self.before)
+        self.assert_preserved()
+
     def test_stopped_save_does_not_start_enable_or_reload(self):
         self.service.running = False
         self.assertFalse(self.run_wizard()['restarted'])

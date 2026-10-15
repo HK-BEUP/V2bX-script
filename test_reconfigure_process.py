@@ -14,9 +14,12 @@ import initconfig
 import upgrade
 
 FIXTURE = r'''
-import json,signal,socket,sys,time
+import json,os,signal,socket,sys,time
 from pathlib import Path
 config = json.loads(Path(sys.argv[1]).read_text())
+for node in config['Nodes']:
+    ledger = Path(sys.argv[3])/node['LegacyAccounting']['Directory'].lstrip('/')
+    if not ledger.is_dir() or ledger.is_symlink() or ledger.stat().st_mode & 0o777 != 0o700 or ledger.stat().st_uid != os.geteuid(): sys.exit(24)
 if config['Nodes'][0]['ApiKey'] == 'reject-fixture': sys.exit(23)
 port = config['Nodes'][0]['NodeID']
 listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -43,7 +46,8 @@ class LocalProcess:
     def validate(self):
         self.required_ports = {n['NodeID'] for n in upgrade.load_config(self.root/'etc/V2bX/config.json')['Nodes']}
     def start(self):
-        self.process = subprocess.Popen([sys.executable,str(self.script),str(self.root/'etc/V2bX/config.json'),str(self.root/'closed')], stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        self.process = subprocess.Popen([sys.executable,str(self.script),str(self.root/'etc/V2bX/config.json'),str(self.root/'closed'),str(self.root)], stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+    def enable(self): self.enabled = True
     def stop(self):
         if self.active(): self.process.terminate()
         if self.process:
@@ -72,6 +76,7 @@ class ProcessTests(unittest.TestCase):
         self.path = self.root/'etc/V2bX/config.json'; self.path.parent.mkdir(parents=True)
         self.path.write_text(json.dumps(initconfig.make_config('https://panel.example','synthetic-key',str(self.old_port))))
         self.original = self.path.read_bytes()
+        initconfig.prepare_new_accounting(self.root, json.loads(self.original)['Nodes'])
         self.script = self.root/'fixture.py'; self.script.write_text(FIXTURE)
         self.service = LocalProcess(self.root,self.script); self.addCleanup(self.service.stop)
         self.service.start(); self.assertTrue(self.service.healthy())
@@ -80,6 +85,15 @@ class ProcessTests(unittest.TestCase):
         replies = iter(['',str(self.new_port),answer])
         with contextlib.redirect_stdout(io.StringIO()):
             return initconfig.reconfigure(self.root,self.service,lambda _:next(replies),lambda _:key)
+    def test_real_fresh_install_starts_with_private_accounting_directory(self):
+        self.service.stop(); self.path.unlink()
+        replies = iter(['https://panel.example',str(self.new_port),'YES'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            initconfig.initialize(self.root,self.service,start=True,read=lambda _:next(replies),secret=lambda _:'synthetic-key')
+        self.assertTrue(self.service.active())
+        self.assertTrue(self.service.healthy())
+        self.assertTrue(self.service.enabled)
+
     def test_real_process_graceful_replacement_and_new_listener(self):
         result = self.configure()
         self.assertTrue(result['restarted'])

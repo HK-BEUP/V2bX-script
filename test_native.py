@@ -24,7 +24,12 @@ fresh=u.transaction(p1,h1,VERSION,Path('/'),service,platform.machine())
 unit=Path('/etc/init.d/V2bX');config=Path('/etc/V2bX/config.json')
 assert unit.read_text()==u.OPENRC_UNIT and unit.stat().st_mode & 0o111
 assert not service.active()
-service.start();service.required_ports=set();assert service.healthy()
+answers=iter(['https://panel.example','406','YES'])
+initconfig.initialize(Path('/'),service,start=True,read=lambda _:next(answers),secret=lambda _:'synthetic-only')
+node=u.load_config(config)['Nodes'][0]
+ledger=Path(node['LegacyAccounting']['Directory'])
+assert ledger.is_dir() and ledger.stat().st_uid==0 and ledger.stat().st_mode & 0o777==0o700
+service.required_ports=set();assert service.healthy()
 before=service.identity();assert before
 assert os.readlink('/proc/'+str(before[0])+'/fd/1')=='/dev/null'
 assert os.readlink('/proc/'+str(before[0])+'/fd/2')=='/dev/null'
